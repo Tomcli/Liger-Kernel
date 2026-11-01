@@ -3,7 +3,9 @@ import torch
 
 from test.utils import assert_verbose_allclose
 from test.utils import set_seed
+from test.utils import supports_bfloat16
 
+from liger_kernel.ops.sparsemax import LigerSparsemaxFunction
 from liger_kernel.ops.sparsemax import _sparsemax_backward_kernel
 from liger_kernel.ops.sparsemax import _sparsemax_forward_kernel
 from liger_kernel.ops.utils import calculate_settings
@@ -76,6 +78,44 @@ def test_liger_sparsemax_correctness(batch_size, seq_len, features, dim, dtype, 
     out_l.backward(g)
     out_t.backward(g)
     assert_verbose_allclose(lx.grad, tx.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dim", [-1, 0])
+@pytest.mark.parametrize("n_cols", [3, 5])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        pytest.param(
+            torch.bfloat16,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this device"),
+        ),
+    ],
+)
+def test_sparsemax_backward_low_precision_support_mean(dim, n_cols, dtype):
+    """Keep the support mean in fp32 until after subtracting it from each gradient."""
+    x = torch.full((2, n_cols), -2.0, device=device, dtype=dtype)
+    x[0, :3] = 0.0
+    x[1, :2] = 0.0
+    grad_output = torch.full_like(x, 8.0)
+    # The support mean is not representable in the input dtype. Rounding it
+    # before subtraction changes the small gradients or rounds them to zero.
+    grad_output[0, :3] = torch.tensor([1.0, 1.0, 1.0078125], device=device, dtype=dtype)
+    grad_output[1, :2] = torch.tensor([1.0, 1.0078125], device=device, dtype=dtype)
+    if dim == 0:
+        x = x.transpose(0, 1)
+        grad_output = grad_output.transpose(0, 1)
+
+    lx = x.clone().requires_grad_(True)
+    tx = x.float().clone().requires_grad_(True)
+    out_l = LigerSparsemaxFunction.apply(lx, dim)
+    out_t = torch_sparsemax(tx, dim=dim)
+    torch.testing.assert_close(out_l, out_t.to(dtype))
+
+    out_l.backward(grad_output)
+    out_t.backward(grad_output.float())
+    torch.testing.assert_close(lx.grad, tx.grad.to(dtype), atol=0, rtol=2 * torch.finfo(dtype).eps)
+    assert torch.count_nonzero(lx.grad[out_l == 0]) == 0
 
 
 @pytest.mark.parametrize(
